@@ -29,6 +29,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::Message, Connector};
 
@@ -105,7 +106,8 @@ async fn status() -> impl Responder {
 
 #[derive(Debug, Clone)]
 struct CashoutEvent {
-    counter:     String,
+    counter:     String,   // hex  e.g. "67B0C3F"
+    counter_dec: u64,      // decimal e.g. 108986431
     player_name: String,
     bet_usd:     f64,
     bet_local:   f64,
@@ -118,7 +120,8 @@ struct CashoutEvent {
 
 #[derive(Debug, Clone)]
 struct BetEvent {
-    counter:     String,
+    counter:     String,   // hex
+    counter_dec: u64,      // decimal
     player_name: String,
     bet_usd:     f64,
     bet_local:   f64,
@@ -251,8 +254,10 @@ fn assign_sub_counters(current_val: u64, count: usize) -> Vec<String> {
 fn parse_cashout(a: &str, counter: &str) -> Option<CashoutEvent> {
     let p: Vec<&str> = a.split('_').collect();
     if p.len() < 9 { return None; }
+    let counter_dec = u64::from_str_radix(counter, 16).unwrap_or(0);
     Some(CashoutEvent {
         counter:     counter.to_string(),
+        counter_dec,
         player_name: p[0].to_string(),
         bet_usd:     p[1].parse().ok()?,
         bet_local:   p[2].parse().ok()?,
@@ -267,8 +272,10 @@ fn parse_cashout(a: &str, counter: &str) -> Option<CashoutEvent> {
 fn parse_bet(a: &str, counter: &str) -> Option<BetEvent> {
     let p: Vec<&str> = a.split('_').collect();
     if p.len() < 9 { return None; }
+    let counter_dec = u64::from_str_radix(counter, 16).unwrap_or(0);
     Some(BetEvent {
         counter:     counter.to_string(),
+        counter_dec,
         player_name: p[0].to_string(),
         bet_usd:     p[1].parse().ok()?,
         bet_local:   p[2].parse().ok()?,
@@ -291,8 +298,10 @@ fn separator(label: &str) {
 fn print_cashout(ev: &CashoutEvent, is_leak: bool) {
     let tag = if is_leak { "[LEAK-CASHOUT]".red().bold() } else { "[CASHOUT]     ".green().bold() };
     println!(
-        "  {} {:>8} | Ctr:{} | Bet:${:.6} ({:.2}{}) | @{:.2}x→${:.6} | Slot:{} | ID:{}",
-        tag, ev.player_name.cyan(), ev.counter.yellow(),
+        "  {} {:>8} | Ctr: {} / {} | Bet:${:.6} ({:.2}{}) | @{:.2}x→${:.6} | Slot:{} | ID:{}",
+        tag, ev.player_name.cyan(),
+        ev.counter.yellow(),                          // HEX
+        ev.counter_dec.to_string().bright_white(),    // DECIMAL
         ev.bet_usd, ev.bet_local, ev.currency,
         ev.multiplier, ev.cashout_usd, ev.slot, ev.player_id.bright_black()
     );
@@ -301,8 +310,10 @@ fn print_cashout(ev: &CashoutEvent, is_leak: bool) {
 fn print_bet(ev: &BetEvent, is_leak: bool) {
     let tag = if is_leak { "[LEAK-BET]    ".magenta().bold() } else { "[BET]         ".blue().bold() };
     println!(
-        "  {} {:>8} | Ctr:{} | Bet:${:.6} ({:.2}{}) | Slot:{} | ID:{}",
-        tag, ev.player_name.cyan(), ev.counter.yellow(),
+        "  {} {:>8} | Ctr: {} / {} | Bet:${:.6} ({:.2}{}) | Slot:{} | ID:{}",
+        tag, ev.player_name.cyan(),
+        ev.counter.yellow(),                          // HEX
+        ev.counter_dec.to_string().bright_white(),    // DECIMAL
         ev.bet_usd, ev.bet_local, ev.currency,
         ev.slot, ev.player_id.bright_black()
     );
@@ -526,10 +537,151 @@ fn process_message(raw: &str, state: &mut AppState) {
     }
 }
 
+// ── Token negotiation — fetches a fresh connectionToken via HTTP ──────────────
+//
+// The 404 error you saw means the hardcoded token in WS_URL has expired.
+// This function calls the SignalR /negotiate endpoint to get a fresh one
+// automatically, so you don't need to paste a new URL on every redeploy —
+// you only need the base token= (the short one, not the long connectionToken).
+//
+// The two-token system:
+//   token=          short auth token  (goes in the negotiate request header)
+//   connectionToken long session token (returned by negotiate, goes in WS URL)
+//
+// We fetch connectionToken fresh on every startup.
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+async fn negotiate_token(base_token: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    println!("  {} Fetching fresh connectionToken from /negotiate…", "[AUTH]".bright_yellow());
+
+    let host = "eu-server-w15.ssgportal.com";
+    let path = format!(
+        "/JetXNode703/signalr/negotiate\
+         ?clientProtocol=1.5\
+         &token={}\
+         &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D",
+        base_token
+    );
+
+    let tcp = match tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect(format!("{}:443", host))
+    ).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => { eprintln!("  {} TCP connect failed: {}", "[AUTH]".red(), e); return None; }
+        Err(_)     => { eprintln!("  {} TCP connect timed out", "[AUTH]".red()); return None; }
+    };
+
+    let cx = match native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+    {
+        Ok(c)  => c,
+        Err(e) => { eprintln!("  {} TLS builder failed: {}", "[AUTH]".red(), e); return None; }
+    };
+    let cx = tokio_native_tls::TlsConnector::from(cx);
+    let mut tls = match cx.connect(host, tcp).await {
+        Ok(s)  => s,
+        Err(e) => { eprintln!("  {} TLS handshake failed: {}", "[AUTH]".red(), e); return None; }
+    };
+
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: JetX-Scraper/1.0\r\n\r\n",
+        path, host
+    );
+    if tls.write_all(req.as_bytes()).await.is_err() { return None; }
+
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut buf)).await;
+
+    let body = String::from_utf8_lossy(&buf);
+    let json_part = body.split("\r\n\r\n").nth(1).unwrap_or("");
+    // handle chunked encoding: skip the chunk-size line if present
+    let json_str = if json_part.trim_start().starts_with('{') {
+        json_part.trim()
+    } else {
+        json_part.lines().nth(1).unwrap_or("").trim()
+    };
+
+    let v: Value = match serde_json::from_str(json_str) {
+        Ok(v)  => v,
+        Err(e) => {
+            eprintln!("  {} Negotiate JSON parse failed: {} | body snippet: {}",
+                "[AUTH]".red(), e, &json_str.chars().take(120).collect::<String>());
+            return None;
+        }
+    };
+
+    match v["ConnectionToken"].as_str() {
+        Some(t) => {
+            println!("  {} Got fresh connectionToken (len={})", "[AUTH]".green(), t.len());
+            Some(t.to_string())
+        }
+        None => {
+            eprintln!("  {} ConnectionToken missing in negotiate response: {}", "[AUTH]".red(), json_str);
+            None
+        }
+    }
+}
+
+fn build_ws_url(host: &str, base_token: &str, connection_token: &str) -> String {
+    format!(
+        "wss://{}/JetXNode703/signalr/connect\
+         ?transport=webSockets\
+         &clientProtocol=1.5\
+         &token={}\
+         &group=JetX\
+         &connectionToken={}\
+         &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D\
+         &tid=4",
+        host,
+        base_token,
+        url_encode(connection_token)
+    )
+}
+
 // ── Single WebSocket session — NO reconnect loop ──────────────────────────────
 
-async fn run_ws_session(ws_url: String) {
+async fn run_ws_session(host: String, base_token: String) {
     let mut state = AppState::new();
+
+    // ── Step 1: negotiate a fresh connectionToken ─────────────────────────────
+    // This is what fixes the 404: the long connectionToken in a hardcoded URL
+    // expires within minutes. We fetch a fresh one every time we start.
+    let ws_url = match negotiate_token(&base_token).await {
+        Some(conn_token) => {
+            let url = build_ws_url(&host, &base_token, &conn_token);
+            println!("  {} WS URL built with fresh token", "[AUTH]".green());
+            url
+        }
+        None => {
+            // Negotiate failed — nothing we can do without a valid token.
+            // Write shutdown record so you know why it stopped.
+            eprintln!(
+                "  {} Could not negotiate a token. \
+                 Check that WS_BASE_TOKEN env var is correct and not expired.",
+                "[ERROR]".red().bold()
+            );
+            WS_DEAD.store(true, Ordering::Relaxed);
+            write_shutdown_record("negotiate_failed_bad_base_token", state.round_number);
+            return;
+        }
+    };
 
     println!("  {} Connecting…", "[WS]".bright_yellow());
 
@@ -563,7 +715,13 @@ async fn run_ws_session(ws_url: String) {
             return;
         }
         Ok(Err(e)) => {
-            eprintln!("  {} WS connect error: {}", "[ERROR]".red(), e);
+            let msg = e.to_string();
+            let hint = if msg.contains("404") || msg.contains("403") || msg.contains("401") {
+                " ← token likely expired; get a fresh WS_BASE_TOKEN from browser DevTools"
+            } else {
+                ""
+            };
+            eprintln!("  {} WS connect error: {}{}", "[ERROR]".red(), msg, hint);
             WS_DEAD.store(true, Ordering::Relaxed);
             write_shutdown_record(&format!("ws_connect_error: {}", e), state.round_number);
             return;
@@ -695,22 +853,29 @@ async fn main() -> std::io::Result<()> {
     println!("    {} /health reports ws_dead=true when session ends", "•".green());
     println!();
 
-    // WS URL: env var WS_URL → CLI arg → panic with helpful message
-    let ws_url = env::var("WS_URL").unwrap_or_else(|_| {
-        std::env::args().nth(1).unwrap_or_else(|| {
-            // Using the URL from the working reference code as fallback.
-            // !! Replace token before deploying — or set WS_URL env var !!
-            "wss://eu-server-w15.ssgportal.com/JetXNode703/signalr/connect\
-             ?transport=webSockets\
-             &clientProtocol=1.5\
-             &token=7f854388-e80e-49d2-bf10-998d69879ce0\
-             &group=JetX\
-             &connectionToken=3fwTFY%2FaFBDxgVzCELGL11e18VfMndoJ9uGPP46WWhkXgkxEtM0GrX2fDFruh1u\
-             %2BBfgPJtstxnVFMUUO2NSOe3JJpEDUXPvjaVYbvHI9gxdsrL6uu4%2B2P0PU7W8FOpBI\
-             &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D\
-             &tid=2".to_string()
-        })
-    });
+    // ── WS config ─────────────────────────────────────────────────────────────
+    // Set these two env vars on your cloud platform — no recompile needed.
+    //
+    //   WS_HOST        the server host, e.g. eu-server-w15.ssgportal.com
+    //                  (the "w15" part sometimes changes — copy from browser DevTools)
+    //
+    //   WS_BASE_TOKEN  the short  token=  value from the WS URL in DevTools
+    //                  e.g.  7f854388-e80e-49d2-bf10-998d69879ce0
+    //                  This is a UUID — it expires but lasts longer than connectionToken.
+    //                  When you get a 404, this is the value you need to refresh.
+    //
+    // The long connectionToken is fetched automatically via /negotiate on startup.
+    // You never need to paste the full 300-character URL again.
+
+    let ws_host = env::var("WS_HOST")
+        .unwrap_or_else(|_| "eu-server-w15.ssgportal.com".to_string());
+
+    let ws_base_token = env::var("WS_BASE_TOKEN")
+        .unwrap_or_else(|_| {
+            // Fallback to the token from the working reference code.
+            // !! Update WS_BASE_TOKEN env var when this expires !!
+            "7f854388-e80e-49d2-bf10-998d69879ce0".to_string()
+        });
 
     let port: u16 = env::var("PORT")
         .unwrap_or_else(|_| "8000".to_string())
@@ -718,19 +883,24 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or(8000);
 
     println!("  HTTP port          : {}", port);
-    println!("  WS node            : {}", ws_url.split('/').nth(2).unwrap_or("?").yellow());
+    println!("  WS host            : {}", ws_host.yellow());
+    println!("  Base token         : {}…", &ws_base_token.chars().take(8).collect::<String>().yellow());
+    println!("  connectionToken    : fetched fresh via /negotiate on startup");
+    println!();
+    println!("  Env vars to set on your cloud platform:");
+    println!("    WS_HOST          = eu-server-wXX.ssgportal.com   (from DevTools)");
+    println!("    WS_BASE_TOKEN    = <uuid token=>                  (from DevTools)");
+    println!("    PORT             = 8000                           (usually auto-set)");
     println!();
     println!("  Point a cron ping at GET /health every 5 minutes:");
     println!("    https://cron-job.org  or  https://uptimerobot.com");
     println!();
-    println!("  When the session ends you will see  ws_dead: true  at /health.");
-    println!("  Check {}  for the exact reason and timestamp.", SHUTDOWN_FILE);
-    println!("  Then redeploy with a fresh WS_URL token.", );
+    println!("  When the session ends: ws_dead=true at /health.");
+    println!("  Check {} for reason + timestamp.", SHUTDOWN_FILE);
+    println!("  Then update WS_BASE_TOKEN if you got a 404, and redeploy.");
     println!();
 
-    // WS runs in a background task so if it dies the HTTP server stays up.
-    // The cloud platform keeps the instance alive because /health still responds.
-    tokio::spawn(run_ws_session(ws_url));
+    tokio::spawn(run_ws_session(ws_host, ws_base_token));
 
     HttpServer::new(|| {
         App::new()
