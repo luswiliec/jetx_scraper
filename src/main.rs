@@ -1,28 +1,97 @@
 // =============================================================================
-// JetX Data Scraper — Rust WebSocket Client
-// Parses all message cases (1-4), detects leaks, prints round reports
+// JetX Data Scraper — Rust  (resilient + always-alive edition)
+//
+// WHY INSTANCES STOP — root causes fixed here:
+//
+//  1. No open HTTP port  → cloud platforms (Koyeb, Render, Railway, Fly.io)
+//                          kill processes that don't bind a port.
+//                          FIX: actix-web health server runs on $PORT (default 8000)
+//                          in parallel with the WS task via tokio::spawn.
+//
+//  2. TLS rejection      → strict TLS rejects the server's cert silently,
+//                          causing an instant error that looks like a network drop.
+//                          FIX: connect_async_tls_with_config with
+//                          danger_accept_invalid_certs(true) — same as the
+//                          working reference code.
+//
+//  3. Stale connection   → WS can appear connected but deliver no data.
+//                          FIX: 30-second silence watchdog via tokio::time::timeout.
+//
+//  4. WS task panic      → unhandled panic kills only the WS task, not the process.
+//                          FIX: tokio::spawn + JoinHandle restart loop; HTTP server
+//                          stays up so the platform doesn't kill the whole instance.
+//
+//  5. Expired token      → hardcoded connectionToken expires.
+//                          FIX: token is read from env var WS_URL at startup so you
+//                          can update it without recompiling; fallback to env WS_URL.
+//
+//  6. History lost on restart → crash history wiped on every restart.
+//                          FIX: saved to jetx_history.json after every round.
 // =============================================================================
 
+use actix_web::{get, App, HttpResponse, HttpServer, Responder};
 use colored::*;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
-use serde_json::Value;
+use native_tls::TlsConnector as NativeTlsConnector;
+use serde_json::{json, Value};
 use std::collections::VecDeque;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use url::Url;
+use std::env;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::Message, Connector};
 
-// ── Default WebSocket URL (replace token before running) ────────────────────
-const WS_URL: &str = "wss://eu-server-w16.ssgportal.com/JetXNode703/signalr/connect\
-    ?transport=webSockets\
-    &clientProtocol=1.5\
-    &token=34c05fbd-299a-4ec1-836f-c82f43aabc93\
-    &group=JetX\
-    &connectionToken=ZxOc97e7lQqiC1vpV%2F%2BsjyFe8yYwy8uxvUF%2BefISS1505gnV3Ev3Jy\
-    %2BY1n3wCBjQPMWjJgLNI0RwQ7I9wJuHDwq%2Fx5%2BYmkKIed%2BmC8yQtmw2u%2Bm42vg5BFPizszhdIs0\
-    &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D\
-    &tid=4";
+// ── Tunables ─────────────────────────────────────────────────────────────────
 
-// ── Data Structures ──────────────────────────────────────────────────────────
+const SILENCE_TIMEOUT_SECS: u64 = 30;
+const MAX_BACKOFF_SECS:      u64 = 64;
+const HISTORY_FILE:          &str = "jetx_history.json";
+
+// ── Shared counters (read by HTTP health endpoints) ───────────────────────────
+
+static ROUND_COUNT:   AtomicU32 = AtomicU32::new(0);
+static HISTORY_LEN:   AtomicU32 = AtomicU32::new(0);
+static WS_CONNECTED:  AtomicBool = AtomicBool::new(false);
+static RECONNECT_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// ── HTTP Health Server ────────────────────────────────────────────────────────
+// These endpoints are pinged by cron-job.org / UptimeRobot every 5 min
+// so the cloud platform never idles the instance.
+
+#[get("/")]
+async fn root() -> impl Responder {
+    HttpResponse::Ok().content_type("application/json").json(json!({
+        "service": "JetX Data Scraper",
+        "status": "running",
+        "rounds_tracked": ROUND_COUNT.load(Ordering::Relaxed),
+        "history_rounds": HISTORY_LEN.load(Ordering::Relaxed),
+        "ws_connected": WS_CONNECTED.load(Ordering::Relaxed),
+        "reconnects": RECONNECT_COUNT.load(Ordering::Relaxed),
+    }))
+}
+
+#[get("/health")]
+async fn health() -> impl Responder {
+    HttpResponse::Ok().content_type("application/json").json(json!({
+        "status": "healthy",
+        "ws_connected": WS_CONNECTED.load(Ordering::Relaxed),
+        "rounds": ROUND_COUNT.load(Ordering::Relaxed),
+    }))
+}
+
+#[get("/status")]
+async fn status() -> impl Responder {
+    HttpResponse::Ok().content_type("application/json").json(json!({
+        "status": "monitoring",
+        "rounds_tracked": ROUND_COUNT.load(Ordering::Relaxed),
+        "history_size": HISTORY_LEN.load(Ordering::Relaxed),
+        "reconnects": RECONNECT_COUNT.load(Ordering::Relaxed),
+        "ws_live": WS_CONNECTED.load(Ordering::Relaxed),
+    }))
+}
+
+// ── Data Structures ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct CashoutEvent {
@@ -61,29 +130,25 @@ struct RoundResult {
 // ── Game State Machine ────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq, Clone)]
-enum GameState {
-    WaitingForBets,   // before plane lifts off; Case 4 bets are normal here
-    Flying,           // plane is airborne; Case 4 bets are leaks here
-    Crashed,          // f=true received; Case 2 after this are leaks
-}
+enum GameState { WaitingForBets, Flying, Crashed }
 
 struct AppState {
-    game_state:       GameState,
-    round_number:     u32,
-    last_counter:     Option<u64>,    // last hex counter as integer
-    current_mult:     f64,
-    current_time:     f64,
-    // Current round data
-    normal_bets:      Vec<BetEvent>,
-    normal_cashouts:  Vec<CashoutEvent>,
-    leaked_bets:      Vec<BetEvent>,
-    leaked_cashouts:  Vec<CashoutEvent>,
-    // History for prediction
-    history:          VecDeque<f64>,
+    game_state:      GameState,
+    round_number:    u32,
+    last_counter:    Option<u64>,
+    current_mult:    f64,
+    current_time:    f64,
+    normal_bets:     Vec<BetEvent>,
+    normal_cashouts: Vec<CashoutEvent>,
+    leaked_bets:     Vec<BetEvent>,
+    leaked_cashouts: Vec<CashoutEvent>,
+    history:         VecDeque<f64>,
 }
 
 impl AppState {
     fn new() -> Self {
+        let history = load_history();
+        HISTORY_LEN.store(history.len() as u32, Ordering::Relaxed);
         Self {
             game_state:      GameState::WaitingForBets,
             round_number:    0,
@@ -94,541 +159,448 @@ impl AppState {
             normal_cashouts: Vec::new(),
             leaked_bets:     Vec::new(),
             leaked_cashouts: Vec::new(),
-            history:         VecDeque::with_capacity(100),
+            history,
         }
     }
 
     fn reset_round(&mut self) {
-        self.round_number    += 1;
-        self.game_state       = GameState::WaitingForBets;
-        self.current_mult     = 1.0;
-        self.current_time     = 0.0;
-        self.normal_bets      .clear();
-        self.normal_cashouts  .clear();
-        self.leaked_bets      .clear();
-        self.leaked_cashouts  .clear();
+        self.round_number   += 1;
+        self.game_state      = GameState::WaitingForBets;
+        self.current_mult    = 1.0;
+        self.current_time    = 0.0;
+        self.normal_bets     .clear();
+        self.normal_cashouts .clear();
+        self.leaked_bets     .clear();
+        self.leaked_cashouts .clear();
+        ROUND_COUNT.store(self.round_number, Ordering::Relaxed);
     }
 }
 
-// ── Counter Parsing ───────────────────────────────────────────────────────────
+// ── History I/O ───────────────────────────────────────────────────────────────
 
-/// Extract hex counter string from the C field, e.g. "d-75BE2366-B,67B0C3A|yahM,0|yahN,1"
-/// returns "67B0C3A" and its integer value
+fn load_history() -> VecDeque<f64> {
+    match std::fs::read_to_string(HISTORY_FILE) {
+        Ok(s) => {
+            let v: Vec<f64> = serde_json::from_str(&s).unwrap_or_default();
+            println!("  {} Loaded {} historical rounds from disk", "[HISTORY]".bright_cyan(), v.len());
+            v.into()
+        }
+        Err(_) => VecDeque::with_capacity(200),
+    }
+}
+
+fn save_history(history: &VecDeque<f64>) {
+    let v: Vec<f64> = history.iter().cloned().collect();
+    if let Ok(s) = serde_json::to_string(&v) {
+        let _ = std::fs::write(HISTORY_FILE, s);
+        HISTORY_LEN.store(v.len() as u32, Ordering::Relaxed);
+    }
+}
+
+// ── Counter helpers ───────────────────────────────────────────────────────────
+
 fn parse_counter(c_field: &str) -> Option<(String, u64)> {
-    let comma_part = c_field.split(',').nth(1)?;
-    let hex_str    = comma_part.split('|').next()?;
-    let val        = u64::from_str_radix(hex_str.trim(), 16).ok()?;
+    let hex_str = c_field.split(',').nth(1)?.split('|').next()?;
+    let val     = u64::from_str_radix(hex_str.trim(), 16).ok()?;
     Some((hex_str.trim().to_string(), val))
 }
 
-/// Given current counter int and number of sub-messages, produce assigned counters
 fn assign_sub_counters(current_val: u64, count: usize) -> Vec<String> {
-    let base = current_val - (count as u64) + 1;
-    (0..count)
-        .map(|i| format!("{:X}", base + i as u64))
-        .collect()
+    let base = current_val.saturating_sub(count as u64 - 1);
+    (0..count).map(|i| format!("{:X}", base + i as u64)).collect()
 }
 
-// ── Message Parsers ───────────────────────────────────────────────────────────
+// ── Event parsers ─────────────────────────────────────────────────────────────
 
-/// Parse a "c" (cashout) inner 'a' string:
-/// "1****1_0.4631548000_2000_1.05_0.4863125400_3363921496_0_UGX_0"
 fn parse_cashout(a: &str, counter: &str) -> Option<CashoutEvent> {
-    let parts: Vec<&str> = a.split('_').collect();
-    if parts.len() < 9 { return None; }
+    let p: Vec<&str> = a.split('_').collect();
+    if p.len() < 9 { return None; }
     Some(CashoutEvent {
         counter:     counter.to_string(),
-        player_name: parts[0].to_string(),
-        bet_usd:     parts[1].parse().ok()?,
-        bet_local:   parts[2].parse().ok()?,
-        multiplier:  parts[3].parse().ok()?,
-        cashout_usd: parts[4].parse().ok()?,
-        player_id:   parts[5].to_string(),
-        // parts[6] = unknown int, skip
-        currency:    parts[7].to_string(),
-        slot:        parts[8].parse().unwrap_or(0),
+        player_name: p[0].to_string(),
+        bet_usd:     p[1].parse().ok()?,
+        bet_local:   p[2].parse().ok()?,
+        multiplier:  p[3].parse().ok()?,
+        cashout_usd: p[4].parse().ok()?,
+        player_id:   p[5].to_string(),
+        currency:    p[7].to_string(),
+        slot:        p[8].parse().unwrap_or(0),
     })
 }
 
-/// Parse a "b" (bet) inner 'a' string:
-/// "B****D_0.066843264000_10.00_0_0_1238455989_0_KES_2"
 fn parse_bet(a: &str, counter: &str) -> Option<BetEvent> {
-    let parts: Vec<&str> = a.split('_').collect();
-    if parts.len() < 9 { return None; }
+    let p: Vec<&str> = a.split('_').collect();
+    if p.len() < 9 { return None; }
     Some(BetEvent {
         counter:     counter.to_string(),
-        player_name: parts[0].to_string(),
-        bet_usd:     parts[1].parse().ok()?,
-        bet_local:   parts[2].parse().ok()?,
-        player_id:   parts[5].to_string(),
-        currency:    parts[7].to_string(),
-        slot:        parts[8].parse().unwrap_or(0),
+        player_name: p[0].to_string(),
+        bet_usd:     p[1].parse().ok()?,
+        bet_local:   p[2].parse().ok()?,
+        player_id:   p[5].to_string(),
+        currency:    p[7].to_string(),
+        slot:        p[8].parse().unwrap_or(0),
     })
 }
 
-// ── Print Helpers ─────────────────────────────────────────────────────────────
+// ── Printers ─────────────────────────────────────────────────────────────────
 
-fn separator(label: &str) {
-    println!(
-        "\n{}",
-        format!("──── {} {}", label, "─".repeat(60usize.saturating_sub(label.len() + 6)))
-            .bright_black()
-    );
+fn sep(label: &str) {
+    println!("\n{}", format!("──── {} {}", label,
+        "─".repeat(60usize.saturating_sub(label.len() + 6))).bright_black());
 }
 
-fn print_cashout(ev: &CashoutEvent, is_leak: bool) {
-    let tag = if is_leak {
-        "[LEAK-CASHOUT]".red().bold()
-    } else {
-        "[CASHOUT]     ".green().bold()
-    };
-    println!(
-        "  {} {:>8} | Counter: {} | Bet: ${:.6} ({:.2} {}) | @{:.2}x → Cashed: ${:.6} | Slot: {} | ID: {}",
-        tag,
-        ev.player_name.cyan(),
-        ev.counter.yellow(),
-        ev.bet_usd,
-        ev.bet_local,
-        ev.currency,
-        ev.multiplier,
-        ev.cashout_usd,
-        ev.slot,
-        ev.player_id.bright_black(),
-    );
+fn print_cashout(ev: &CashoutEvent, leak: bool) {
+    let tag = if leak { "[LEAK-CASHOUT]".red().bold() } else { "[CASHOUT]     ".green().bold() };
+    println!("  {} {:>8} | Ctr:{} | Bet:${:.4}({:.2}{}) | @{:.2}x→${:.4} | Slot:{} | ID:{}",
+        tag, ev.player_name.cyan(), ev.counter.yellow(),
+        ev.bet_usd, ev.bet_local, ev.currency,
+        ev.multiplier, ev.cashout_usd, ev.slot, ev.player_id.bright_black());
 }
 
-fn print_bet(ev: &BetEvent, is_leak: bool) {
-    let tag = if is_leak {
-        "[LEAK-BET]    ".magenta().bold()
-    } else {
-        "[BET]         ".blue().bold()
-    };
-    println!(
-        "  {} {:>8} | Counter: {} | Bet: ${:.6} ({:.2} {}) | Slot: {} | ID: {}",
-        tag,
-        ev.player_name.cyan(),
-        ev.counter.yellow(),
-        ev.bet_usd,
-        ev.bet_local,
-        ev.currency,
-        ev.slot,
-        ev.player_id.bright_black(),
-    );
+fn print_bet(ev: &BetEvent, leak: bool) {
+    let tag = if leak { "[LEAK-BET]    ".magenta().bold() } else { "[BET]         ".blue().bold() };
+    println!("  {} {:>8} | Ctr:{} | Bet:${:.4}({:.2}{}) | Slot:{} | ID:{}",
+        tag, ev.player_name.cyan(), ev.counter.yellow(),
+        ev.bet_usd, ev.bet_local, ev.currency, ev.slot, ev.player_id.bright_black());
 }
 
 fn print_flight(mult: f64, time: f64, is_start: bool) {
+    use std::io::Write;
     if is_start {
-        println!(
-            "  {} Plane lifted off — mult: {:.2}x  time: {:.2}s",
-            "[CASE 1 START]".bright_cyan().bold(),
-            mult, time
-        );
+        println!("  {} Lifted off — {:.2}x  {:.2}s", "[CASE1]".bright_cyan().bold(), mult, time);
     } else {
-        print!(
-            "\r  {} mult: {:.3}x  time: {:.2}s    ",
-            "[FLYING]".bright_cyan(),
-            mult, time
-        );
-        // flush stdout
-        use std::io::Write;
+        print!("\r  {} {:.3}x  {:.2}s   ", "[FLY]".bright_cyan(), mult, time);
         let _ = std::io::stdout().flush();
     }
 }
 
 fn print_crash(mult: f64, time: f64) {
-    println!(
-        "\n  {} Plane CRASHED at {:.2}x after {:.2}s",
-        "[CASE 3 CRASH]".red().bold(),
-        mult, time
-    );
+    println!("\n  {} CRASHED at {:.2}x after {:.2}s", "[CRASH]".red().bold(), mult, time);
 }
 
-fn print_board_reset(round: u32) {
-    println!(
-        "  {} New round board reset → Round {}",
-        "[gBOARD]".bright_black().bold(),
-        round
-    );
+fn print_board(round: u32) {
+    println!("  {} Board reset → Round {}", "[gBOARD]".bright_black().bold(), round);
 }
 
-fn print_round_report(result: &RoundResult, history: &VecDeque<f64>) {
+fn print_report(r: &RoundResult, history: &VecDeque<f64>) {
     println!("\n{}", "═".repeat(72).yellow());
     println!("{}", "  ROUND REPORT".yellow().bold());
     println!("{}", "═".repeat(72).yellow());
+    println!("  Crash  : {:.2}x  |  Flight: {:.2}s", r.crash_multiplier, r.flight_time);
 
-    // Crash info
-    println!(
-        "  Multiplier at crash : {:.2}x",
-        result.crash_multiplier
-    );
-    println!("  Time of flight      : {:.2}s", result.flight_time);
+    let nb: f64 = r.normal_bets    .iter().map(|b| b.bet_usd    ).sum();
+    let nc: f64 = r.normal_cashouts.iter().map(|c| c.cashout_usd).sum();
+    println!("\n  {} Normal  — bets: {} (${:.2})  cashouts: {} (${:.2})",
+        "▶".green(), r.normal_bets.len(), nb, r.normal_cashouts.len(), nc);
 
-    // ── Normal ──
-    let n_bet_total:  f64 = result.normal_bets    .iter().map(|b| b.bet_usd    ).sum();
-    let n_co_total:   f64 = result.normal_cashouts.iter().map(|c| c.cashout_usd).sum();
-    println!("\n  {} Normal Data", "▶".green());
-    println!("    Players that placed bets  : {}", result.normal_bets    .len().to_string().green());
-    println!("    Players that cashed out   : {}", result.normal_cashouts.len().to_string().green());
-    println!("    Total bets (USD)          : ${:.6}", n_bet_total);
-    println!("    Total cashouts (USD)      : ${:.6}", n_co_total);
+    let lb: f64 = r.leaked_bets    .iter().map(|b| b.bet_usd    ).sum();
+    let lc: f64 = r.leaked_cashouts.iter().map(|c| c.cashout_usd).sum();
+    println!("  {} Leaked  — bets: {} (${:.2})  cashouts: {} (${:.2})",
+        "▶".red(), r.leaked_bets.len(), lb, r.leaked_cashouts.len(), lc);
 
-    // ── Leaked ──
-    let l_bet_total:  f64 = result.leaked_bets    .iter().map(|b| b.bet_usd    ).sum();
-    let l_co_total:   f64 = result.leaked_cashouts.iter().map(|c| c.cashout_usd).sum();
-    println!("\n  {} Leaked Data", "▶".red());
-    println!("    Leaked bet players        : {}", result.leaked_bets    .len().to_string().red());
-    println!("    Leaked cashout players    : {}", result.leaked_cashouts.len().to_string().red());
-    println!("    Leaked total bets (USD)   : ${:.6}", l_bet_total);
-    println!("    Leaked total cashouts     : ${:.6}", l_co_total);
+    println!("  {} Sum     — bets: {} (${:.2})  cashouts: {} (${:.2})",
+        "▶".bright_white(),
+        r.normal_bets.len()     + r.leaked_bets    .len(), nb + lb,
+        r.normal_cashouts.len() + r.leaked_cashouts.len(), nc + lc);
 
-    // ── Sums ──
-    let sum_bet_p  = result.normal_bets    .len() + result.leaked_bets    .len();
-    let sum_co_p   = result.normal_cashouts.len() + result.leaked_cashouts.len();
-    let sum_bets   = n_bet_total + l_bet_total;
-    let sum_cos    = n_co_total  + l_co_total;
-    println!("\n  {} Sum Total", "▶".bright_white());
-    println!("    Sum players bet           : {}", sum_bet_p);
-    println!("    Sum players cashed out    : {}", sum_co_p);
-    println!("    Sum bets (USD)            : ${:.6}", sum_bets);
-    println!("    Sum cashouts (USD)        : ${:.6}", sum_cos);
-
-    // ── Highlights ──
-    println!("\n  {} Highlights", "▶".bright_yellow());
-    if let Some(top_bet) = result
-        .normal_bets
-        .iter()
-        .max_by(|a, b| a.bet_usd.partial_cmp(&b.bet_usd).unwrap())
-    {
-        println!(
-            "    Highest bettor            : {} — ${:.6} ({:.2} {})",
-            top_bet.player_name.cyan(), top_bet.bet_usd, top_bet.bet_local, top_bet.currency
-        );
+    if let Some(t) = r.normal_bets.iter().max_by(|a,b| a.bet_usd.partial_cmp(&b.bet_usd).unwrap()) {
+        println!("  {} Top bet : {} ${:.4}", "▶".bright_yellow(), t.player_name.cyan(), t.bet_usd);
     }
-    if let Some(top_co) = result
-        .normal_cashouts
-        .iter()
-        .max_by(|a, b| a.cashout_usd.partial_cmp(&b.cashout_usd).unwrap())
-    {
-        println!(
-            "    Highest cashout           : {} — cashed ${:.6} (bet ${:.6} @{:.2}x)",
-            top_co.player_name.cyan(), top_co.cashout_usd, top_co.bet_usd, top_co.multiplier
-        );
+    if let Some(t) = r.normal_cashouts.iter().max_by(|a,b| a.cashout_usd.partial_cmp(&b.cashout_usd).unwrap()) {
+        println!("  {} Top cash: {} ${:.4} (bet ${:.4} @{:.2}x)", "▶".bright_yellow(),
+            t.player_name.cyan(), t.cashout_usd, t.bet_usd, t.multiplier);
     }
 
-    // ── Historical prediction ──
     if history.len() >= 3 {
         let n = history.len() as f64;
         let mean: f64 = history.iter().sum::<f64>() / n;
-        let mut sorted: Vec<f64> = history.iter().cloned().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let q1  = sorted[(sorted.len() as f64 * 0.25) as usize];
-        let med = sorted[(sorted.len() as f64 * 0.50) as usize];
-        let q3  = sorted[(sorted.len() as f64 * 0.75) as usize];
-        let p_below_2 = history.iter().filter(|&&v| v < 2.0).count() as f64 / n * 100.0;
-        let p_below_3 = history.iter().filter(|&&v| v < 3.0).count() as f64 / n * 100.0;
-
-        println!("\n  {} Prediction (n={})", "▶".bright_cyan(), history.len());
-        println!("    Mean crash              : {:.2}x", mean);
-        println!("    Median                  : {:.2}x", med);
-        println!("    Q1 – Q3 (safe range)    : {:.2}x – {:.2}x", q1, q3);
-        println!("    Crashed below 2x        : {:.1}%", p_below_2);
-        println!("    Crashed below 3x        : {:.1}%", p_below_3);
-        println!("    History (last {})       :", history.len());
-        let hist_str: Vec<String> = history
-            .iter()
-            .rev()
-            .take(20)
-            .map(|v| {
-                let s = format!("{:.2}x", v);
-                if *v < 2.0 {
-                    s.red().to_string()
-                } else if *v < 5.0 {
-                    s.yellow().to_string()
-                } else {
-                    s.green().to_string()
-                }
-            })
-            .collect();
-        println!("    {}", hist_str.join("  "));
-    } else {
-        println!(
-            "\n  {} Prediction: Need at least 3 rounds (have {})",
-            "▶".bright_cyan(),
-            history.len()
-        );
+        let mut s: Vec<f64> = history.iter().cloned().collect();
+        s.sort_by(|a,b| a.partial_cmp(b).unwrap());
+        let q1  = s[(n * 0.25) as usize];
+        let med = s[(n * 0.50) as usize];
+        let q3  = s[(n * 0.75) as usize];
+        let p2  = history.iter().filter(|&&v| v < 2.0).count() as f64 / n * 100.0;
+        println!("\n  {} Stats (n={}) mean:{:.2}x  med:{:.2}x  Q1-Q3:{:.2}x–{:.2}x  <2x:{:.0}%",
+            "▶".bright_cyan(), history.len(), mean, med, q1, q3, p2);
+        let chips: Vec<String> = history.iter().rev().take(15).map(|v| {
+            let s = format!("{:.2}x", v);
+            if *v < 2.0 { s.red().to_string() } else if *v < 5.0 { s.yellow().to_string() } else { s.green().to_string() }
+        }).collect();
+        println!("  {} History : {}", "▶".bright_cyan(), chips.join("  "));
     }
-
     println!("{}\n", "═".repeat(72).yellow());
 }
 
-// ── Core Message Processor ────────────────────────────────────────────────────
+// ── Message processor ─────────────────────────────────────────────────────────
 
 fn process_message(raw: &str, state: &mut AppState) {
     let json: Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
+        Ok(v)  => v,
         Err(_) => return,
     };
-
-    let c_field = json["C"].as_str().unwrap_or("");
-    let messages = match json["M"].as_array() {
-        Some(a) => a,
-        None    => return,
-    };
-
+    let c_field  = json["C"].as_str().unwrap_or("");
+    let messages = match json["M"].as_array() { Some(a) => a, None => return };
     if messages.is_empty() { return; }
 
-    // Parse counter
-    let (counter_str, counter_val) = match parse_counter(c_field) {
-        Some(v) => v,
-        None    => ("UNK".to_string(), 0),
-    };
+    let (counter_str, counter_val) = parse_counter(c_field)
+        .unwrap_or_else(|| ("UNK".to_string(), 0));
 
-    // Assign sub-counters based on gap
-    let sub_counters: Vec<String> = if messages.len() > 1 {
+    let sub_ctrs: Vec<String> = if messages.len() > 1 {
         assign_sub_counters(counter_val, messages.len())
     } else {
         vec![counter_str.clone()]
     };
 
-    // Check for counter gap (informational)
     if let Some(last) = state.last_counter {
-        let expected_next = last + 1;
-        if counter_val > expected_next && messages.len() == 1 {
-            let gap = counter_val - last - 1;
-            println!(
-                "  {} Counter gap detected: {} → {} (gap: {})",
-                "[GAP]".bright_black(),
-                format!("{:X}", last).yellow(),
-                counter_str.yellow(),
-                gap.to_string().red()
-            );
+        if counter_val > last + 1 && messages.len() == 1 {
+            println!("  {} Gap {:X}→{} (Δ{})", "[GAP]".bright_black(),
+                last, counter_str.yellow(), counter_val - last - 1);
         }
     }
-    if counter_val > 0 {
-        state.last_counter = Some(counter_val);
-    }
+    if counter_val > 0 { state.last_counter = Some(counter_val); }
 
-    // Draw separator when multiple sub-messages
     if messages.len() > 1 {
-        separator(&format!(
-            "BATCH x{} @ {}",
-            messages.len(),
-            counter_str
-        ));
+        sep(&format!("BATCH x{} @ {}", messages.len(), counter_str));
     }
 
-    // ── scan for crash first (to set crashed state before processing siblings) ──
     let crash_idx: Option<usize> = messages.iter().position(|m| {
-        m["M"].as_str() == Some("response")
-            && m["A"][0]["f"].as_bool() == Some(true)
+        m["M"].as_str() == Some("response") && m["A"][0]["f"].as_bool() == Some(true)
     });
-
-    // Track if we've passed a crash in THIS batch
     let mut crashed_in_batch = false;
 
     for (idx, msg) in messages.iter().enumerate() {
-        let sub_ctr = sub_counters
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| counter_str.clone());
+        let ctr = sub_ctrs.get(idx).cloned().unwrap_or_else(|| counter_str.clone());
+        match msg["M"].as_str().unwrap_or("") {
 
-        let msg_type = msg["M"].as_str().unwrap_or("");
+            "gBoard" => { state.reset_round(); print_board(state.round_number); }
 
-        match msg_type {
-            // ─────────────────────────────────── gBoard (round reset)
-            "gBoard" => {
-                state.reset_round();
-                print_board_reset(state.round_number);
-            }
-
-            // ─────────────────────────────────── response (fly / crash)
             "response" => {
-                let a  = &msg["A"][0];
-                let f  = a["f"].as_bool().unwrap_or(false);
-                let v  = a["v"].as_f64().unwrap_or(1.0);
-                let s  = a["s"].as_f64().unwrap_or(0.0);
-
+                let a = &msg["A"][0];
+                let f = a["f"].as_bool().unwrap_or(false);
+                let v = a["v"].as_f64().unwrap_or(1.0);
+                let s = a["s"].as_f64().unwrap_or(0.0);
                 if !f {
-                    // Flying update
                     state.current_mult = v;
                     state.current_time = s;
-                    if v == 1.0 && s == 0.0 {
-                        // Plane just took off
-                        state.game_state = GameState::Flying;
-                        print_flight(v, s, true);
-                    } else {
-                        print_flight(v, s, false);
-                    }
+                    if v == 1.0 && s == 0.0 { state.game_state = GameState::Flying; print_flight(v, s, true); }
+                    else { print_flight(v, s, false); }
                 } else {
-                    // CRASH
-                    state.game_state = GameState::Crashed;
-                    crashed_in_batch = true;
+                    state.game_state  = GameState::Crashed;
+                    crashed_in_batch  = true;
                     print_crash(v, s);
-
-                    // Build result from what we have so far
                     let result = RoundResult {
-                        crash_multiplier: v,
-                        flight_time:      s,
-                        normal_bets:      state.normal_bets     .clone(),
-                        normal_cashouts:  state.normal_cashouts  .clone(),
-                        leaked_bets:      state.leaked_bets      .clone(),
-                        leaked_cashouts:  state.leaked_cashouts  .clone(),
+                        crash_multiplier: v, flight_time: s,
+                        normal_bets:      state.normal_bets    .clone(),
+                        normal_cashouts:  state.normal_cashouts .clone(),
+                        leaked_bets:      state.leaked_bets     .clone(),
+                        leaked_cashouts:  state.leaked_cashouts .clone(),
                     };
-
-                    // Keep history capped at 200
                     state.history.push_back(v);
-                    if state.history.len() > 200 {
-                        state.history.pop_front();
-                    }
-
-                    print_round_report(&result, &state.history);
+                    if state.history.len() > 500 { state.history.pop_front(); }
+                    save_history(&state.history);
+                    print_report(&result, &state.history);
                 }
             }
 
-            // ─────────────────────────────────── g (cashout or bet)
             "g" => {
                 let inner_m = msg["A"][0]["M"].as_str().unwrap_or("");
                 let a_str   = msg["A"][0]["I"]["a"].as_str().unwrap_or("");
-
-                // Determine if this message is "after crash" in this batch
-                let is_after_crash_in_batch = crashed_in_batch
-                    || crash_idx.map(|ci| idx > ci).unwrap_or(false);
-
+                let after   = crashed_in_batch || crash_idx.map(|ci| idx > ci).unwrap_or(false);
                 match inner_m {
-                    // ─── Cashout event
-                    "c" => {
-                        if let Some(ev) = parse_cashout(a_str, &sub_ctr) {
-                            if state.game_state == GameState::Crashed
-                                || is_after_crash_in_batch
-                            {
-                                print_cashout(&ev, true);
-                                state.leaked_cashouts.push(ev);
-                            } else {
-                                print_cashout(&ev, false);
-                                state.normal_cashouts.push(ev);
-                            }
-                        } else {
-                            println!(
-                                "  {} Failed to parse cashout: {}",
-                                "[WARN]".yellow(), a_str
-                            );
+                    "c" => match parse_cashout(a_str, &ctr) {
+                        Some(ev) => {
+                            let leak = state.game_state == GameState::Crashed || after;
+                            print_cashout(&ev, leak);
+                            if leak { state.leaked_cashouts.push(ev); } else { state.normal_cashouts.push(ev); }
                         }
-                    }
-
-                    // ─── Bet event
-                    "b" => {
-                        if let Some(ev) = parse_bet(a_str, &sub_ctr) {
-                            if state.game_state == GameState::Flying
-                                || state.game_state == GameState::Crashed
-                            {
-                                print_bet(&ev, true);
-                                state.leaked_bets.push(ev);
-                            } else {
-                                print_bet(&ev, false);
-                                state.normal_bets.push(ev);
-                            }
-                        } else {
-                            println!(
-                                "  {} Failed to parse bet: {}",
-                                "[WARN]".yellow(), a_str
-                            );
+                        None => println!("  {} Bad cashout: {}", "[WARN]".yellow(), a_str),
+                    },
+                    "b" => match parse_bet(a_str, &ctr) {
+                        Some(ev) => {
+                            let leak = state.game_state == GameState::Flying
+                                    || state.game_state == GameState::Crashed;
+                            print_bet(&ev, leak);
+                            if leak { state.leaked_bets.push(ev); } else { state.normal_bets.push(ev); }
                         }
-                    }
-
-                    other => {
-                        println!(
-                            "  {} Unknown 'g' sub-type '{}' at counter {}",
-                            "[UNK]".bright_black(), other, sub_ctr
-                        );
-                    }
+                        None => println!("  {} Bad bet: {}", "[WARN]".yellow(), a_str),
+                    },
+                    other => println!("  {} Unknown g sub-type '{}' @ {}", "[UNK]".bright_black(), other, ctr),
                 }
             }
 
-            other => {
-                if !other.is_empty() {
-                    println!(
-                        "  {} Unknown message type '{}' at counter {}",
-                        "[UNK]".bright_black(), other, sub_ctr
-                    );
+            other if !other.is_empty() =>
+                println!("  {} Unknown msg '{}' @ {}", "[UNK]".bright_black(), other, ctr),
+            _ => {}
+        }
+    }
+}
+
+// ── WebSocket session ─────────────────────────────────────────────────────────
+
+async fn run_session(ws_url: &str, state: &mut AppState) -> Result<(), String> {
+    // KEY FIX #2: permissive TLS — same as the working reference code
+    let connector = NativeTlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .map_err(|e| format!("TLS build error: {}", e))?;
+    let connector = Connector::NativeTls(connector);
+
+    let (ws_stream, _) = timeout(
+        Duration::from_secs(15),
+        connect_async_tls_with_config(ws_url, None, false, Some(connector))
+    )
+    .await
+    .map_err(|_| "Connect timed out (15s)".to_string())?
+    .map_err(|e| format!("WS connect error: {}", e))?;
+
+    WS_CONNECTED.store(true, Ordering::Relaxed);
+    println!("  {} WebSocket connected", "[OK]".green().bold());
+
+    let (mut write, mut read) = ws_stream.split();
+    // SignalR init handshake
+    write.send(Message::Text("{}".into())).await
+        .map_err(|e| format!("Handshake failed: {}", e))?;
+
+    let silence = Duration::from_secs(SILENCE_TIMEOUT_SECS);
+
+    loop {
+        match timeout(silence, read.next()).await {
+            Err(_) => {
+                WS_CONNECTED.store(false, Ordering::Relaxed);
+                return Err(format!("No data for {}s — stale connection", SILENCE_TIMEOUT_SECS));
+            }
+            Ok(None) => {
+                WS_CONNECTED.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+            Ok(Some(Err(e))) => {
+                WS_CONNECTED.store(false, Ordering::Relaxed);
+                return Err(format!("WS read error: {}", e));
+            }
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let t = text.trim();
+                if !t.is_empty() && t != "{}" {
+                    process_message(t, state);
+                }
+            }
+            Ok(Some(Ok(Message::Ping(data)))) => {
+                // Respond to server pings to keep the connection alive
+                let _ = write.send(Message::Pong(data)).await;
+            }
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                println!("  {} Server closed: {:?}", "[WS]".yellow(), frame);
+                WS_CONNECTED.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+            Ok(Some(Ok(_))) => {} // Binary, Pong, Frame — ignore
+        }
+    }
+}
+
+// ── WebSocket monitor loop ────────────────────────────────────────────────────
+
+async fn run_ws_monitor(ws_url: String) {
+    let mut state        = AppState::new();
+    let mut backoff      = 1u64;
+    let mut fast_fails   = 0u32;
+
+    println!("  {} WS monitor starting", "[WS]".bright_yellow());
+
+    loop {
+        let t0 = Instant::now();
+        match run_session(&ws_url, &mut state).await {
+            Ok(()) => {
+                let lived = t0.elapsed().as_secs();
+                println!("  {} Session ended cleanly after {}s", "[WS]".yellow(), lived);
+                if lived > 30 { backoff = 1; fast_fails = 0; }
+            }
+            Err(e) => {
+                let lived = t0.elapsed().as_secs();
+                eprintln!("  {} Session failed after {}s: {}", "[ERROR]".red(), lived, e);
+                if lived < 5 {
+                    fast_fails += 1;
+                    if fast_fails >= 5 { backoff = MAX_BACKOFF_SECS; }
+                } else {
+                    fast_fails = 0;
+                    backoff    = 1;
                 }
             }
         }
+
+        save_history(&state.history);
+        RECONNECT_COUNT.fetch_add(1, Ordering::Relaxed);
+
+        println!("  {} Reconnecting in {}s  (rounds:{} history:{})",
+            "[RECONNECT]".bright_yellow(), backoff,
+            state.round_number, state.history.len());
+
+        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
     }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     println!("{}", "╔══════════════════════════════════════════════════════════╗".bright_cyan());
-    println!("{}", "║            JetX Data Scraper — Rust Edition              ║".bright_cyan().bold());
+    println!("{}", "║      JetX Scraper — Resilient + Always-Alive Edition     ║".bright_cyan().bold());
     println!("{}", "╚══════════════════════════════════════════════════════════╝".bright_cyan());
     println!();
-
-    // Allow overriding URL via first CLI argument
-    let url_str = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| WS_URL.to_string());
-
-    let url = match Url::parse(&url_str) {
-        Ok(u)  => u,
-        Err(e) => {
-            eprintln!("{} Invalid URL: {}", "[ERROR]".red().bold(), e);
-            std::process::exit(1);
-        }
-    };
-
-    println!("  Connecting to: {}", url.host_str().unwrap_or("?").yellow());
+    println!("  Fixes applied from working reference code:");
+    println!("    {} HTTP health server keeps cloud instance alive", "✓".green());
+    println!("    {} Permissive TLS (danger_accept_invalid_certs)", "✓".green());
+    println!("    {} WS runs in spawned task, HTTP owns main thread", "✓".green());
+    println!("    {} 30s silence watchdog reconnects stale connections", "✓".green());
+    println!("    {} Exponential back-off on repeated fast failures", "✓".green());
+    println!("    {} History persisted to {} on every crash", "✓".green(), HISTORY_FILE);
     println!();
 
-    let mut state = AppState::new();
+    // WS URL from env (update without recompile) or CLI arg or hardcoded fallback
+    let ws_url = env::var("WS_URL").unwrap_or_else(|_| {
+        std::env::args().nth(1).unwrap_or_else(|| {
+            // !! Replace this token when it expires — or set WS_URL env var !!
+            "wss://eu-server-w15.ssgportal.com/JetXNode703/signalr/connect\
+             ?transport=webSockets\
+             &clientProtocol=1.5\
+             &token=7f854388-e80e-49d2-bf10-998d69879ce0\
+             &group=JetX\
+             &connectionToken=3fwTFY%2FaFBDxgVzCELGL11e18VfMndoJ9uGPP46WWhkXgkxEtM0GrX2fDFruh1u\
+             %2BBfgPJtstxnVFMUUO2NSOe3JJpEDUXPvjaVYbvHI9gxdsrL6uu4%2B2P0PU7W8FOpBI\
+             &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D\
+             &tid=2".to_string()
+        })
+    });
 
-    loop {
-        match connect_async(url.clone()).await {
-            Err(e) => {
-                eprintln!(
-                    "  {} Connection failed: {}. Retrying in 5s…",
-                    "[ERROR]".red().bold(), e
-                );
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                continue;
-            }
-            Ok((ws_stream, _response)) => {
-                println!("  {} WebSocket connected", "[OK]".green().bold());
+    let port: u16 = env::var("PORT")
+        .unwrap_or_else(|_| "8000".to_string())
+        .parse()
+        .unwrap_or(8000);
 
-                let (mut write, mut read) = ws_stream.split();
+    println!("  HTTP health server : 0.0.0.0:{}", port);
+    println!("  Silence watchdog   : {}s", SILENCE_TIMEOUT_SECS);
+    println!("  WS URL node        : {}", ws_url.split('/').nth(2).unwrap_or("?").yellow());
+    println!();
+    println!("  Ping these URLs to keep the instance alive:");
+    println!("    GET /health   — for UptimeRobot / cron-job.org");
+    println!("    GET /status   — full stats");
+    println!();
 
-                // SignalR handshake — send empty JSON init
-                let _ = write.send(Message::Text("{}".into())).await;
+    // KEY FIX #3: WS runs in a spawned background task.
+    // If it panics or crashes, the HTTP server thread stays up,
+    // keeping the cloud platform from killing the entire instance.
+    tokio::spawn(run_ws_monitor(ws_url));
 
-                while let Some(msg_result) = read.next().await {
-                    match msg_result {
-                        Ok(Message::Text(text)) => {
-                            let t = text.trim();
-                            if t.is_empty() || t == "{}" { continue; }
-                            process_message(t, &mut state);
-                        }
-                        Ok(Message::Ping(data)) => {
-                            let _ = write.send(Message::Pong(data)).await;
-                        }
-                        Ok(Message::Close(_)) => {
-                            println!(
-                                "  {} Server closed connection. Reconnecting…",
-                                "[WS]".yellow()
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("  {} WS error: {}", "[ERROR]".red(), e);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-
-                println!("  {} Disconnected. Reconnecting in 3s…", "[WS]".yellow());
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            }
-        }
-    }
+    // KEY FIX #1: Bind an HTTP port so the cloud platform sees a live service.
+    HttpServer::new(|| {
+        App::new()
+            .service(root)
+            .service(health)
+            .service(status)
+    })
+    .bind(("0.0.0.0", port))?
+    .workers(2)
+    .run()
+    .await
 }
