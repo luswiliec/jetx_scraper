@@ -1,6 +1,6 @@
 [package]
-name = "jetx_scraper"
-version = "0.2.0"
+name    = "jetx_scraper"
+version = "0.1.0"
 edition = "2021"
 
 [[bin]]
@@ -8,31 +8,29 @@ name = "jetx_scraper"
 path = "src/main.rs"
 
 [dependencies]
-# WebSocket — with native-tls so we can pass a permissive connector
+# ── WebSocket — with native-tls feature, exactly like the working reference ──
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
-tungstenite        = "0.21"
+tungstenite        = { version = "0.21", features = ["native-tls"] }
 
-# Async runtime
+# ── TLS — same builder the working reference uses ────────────────────────────
+native-tls = "0.2"
+
+# ── Async runtime ─────────────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }
 
-# JSON
+# ── Futures ───────────────────────────────────────────────────────────────────
+futures-util = "0.3"
+
+# ── JSON ──────────────────────────────────────────────────────────────────────
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# HTTP health server (keeps the cloud process alive)
+# ── HTTP server (keeps cloud instance alive) — same as working reference ─────
 actix-web = "4"
 
-# TLS
-native-tls = "0.2"
-
-# Futures
-futures-util = "0.3"
-
-# Colored output
+# ── Terminal colours ──────────────────────────────────────────────────────────
 colored = "2"
-
-# Signal handling (Ctrl-C / SIGTERM)
-ctrlc = { version = "3", features = ["termination"] }
 
 [profile.release]
 opt-level = 3
+strip     = "symbols"   # smaller binary, faster cold start
