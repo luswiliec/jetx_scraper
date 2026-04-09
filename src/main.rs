@@ -26,10 +26,8 @@ use futures_util::{SinkExt, StreamExt};
 use native_tls::TlsConnector as NativeTlsConnector;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::Message, Connector};
 
@@ -537,160 +535,38 @@ fn process_message(raw: &str, state: &mut AppState) {
     }
 }
 
-// ── Token negotiation — fetches a fresh connectionToken via HTTP ──────────────
+// ── Single WebSocket session — NO reconnect, NO negotiate, NO env vars ────────
 //
-// The 404 error you saw means the hardcoded token in WS_URL has expired.
-// This function calls the SignalR /negotiate endpoint to get a fresh one
-// automatically, so you don't need to paste a new URL on every redeploy —
-// you only need the base token= (the short one, not the long connectionToken).
+// HOW TO UPDATE THE URL WHEN YOU GET A 404:
+//   1. Open Betway JetX in Chrome
+//   2. DevTools → Network → WS tab → click the connection → copy the full URL
+//   3. Paste it below as WS_URL, replacing the old one
+//   4. Redeploy
 //
-// The two-token system:
-//   token=          short auth token  (goes in the negotiate request header)
-//   connectionToken long session token (returned by negotiate, goes in WS URL)
-//
-// We fetch connectionToken fresh on every startup.
+// That's it. No env vars. No negotiate. Just paste and redeploy.
 
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
+// !! PASTE YOUR FULL WEBSOCKET URL HERE — replace on every redeploy !!
+const WS_URL: &str = "wss://eu-server-w15.ssgportal.com/JetXNode703/signalr/connect\
+    ?transport=webSockets\
+    &clientProtocol=1.5\
+    &token=7f854388-e80e-49d2-bf10-998d69879ce0\
+    &group=JetX\
+    &connectionToken=3fwTFY%2FaFBDxgVzCELGL11e18VfMndoJ9uGPP46WWhkXgkxEtM0GrX2fDFruh1u\
+    %2BBfgPJtstxnVFMUUO2NSOe3JJpEDUXPvjaVYbvHI9gxdsrL6uu4%2B2P0PU7W8FOpBI\
+    &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D\
+    &tid=2";
 
-async fn negotiate_token(base_token: &str) -> Option<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-
-    println!("  {} Fetching fresh connectionToken from /negotiate…", "[AUTH]".bright_yellow());
-
-    let host = "eu-server-w15.ssgportal.com";
-    let path = format!(
-        "/JetXNode703/signalr/negotiate\
-         ?clientProtocol=1.5\
-         &token={}\
-         &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D",
-        base_token
-    );
-
-    let tcp = match tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect(format!("{}:443", host))
-    ).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => { eprintln!("  {} TCP connect failed: {}", "[AUTH]".red(), e); return None; }
-        Err(_)     => { eprintln!("  {} TCP connect timed out", "[AUTH]".red()); return None; }
-    };
-
-    let cx = match native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .build()
-    {
-        Ok(c)  => c,
-        Err(e) => { eprintln!("  {} TLS builder failed: {}", "[AUTH]".red(), e); return None; }
-    };
-    let cx = tokio_native_tls::TlsConnector::from(cx);
-    let mut tls = match cx.connect(host, tcp).await {
-        Ok(s)  => s,
-        Err(e) => { eprintln!("  {} TLS handshake failed: {}", "[AUTH]".red(), e); return None; }
-    };
-
-    let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: JetX-Scraper/1.0\r\n\r\n",
-        path, host
-    );
-    if tls.write_all(req.as_bytes()).await.is_err() { return None; }
-
-    let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut buf)).await;
-
-    let body = String::from_utf8_lossy(&buf);
-    let json_part = body.split("\r\n\r\n").nth(1).unwrap_or("");
-    // handle chunked encoding: skip the chunk-size line if present
-    let json_str = if json_part.trim_start().starts_with('{') {
-        json_part.trim()
-    } else {
-        json_part.lines().nth(1).unwrap_or("").trim()
-    };
-
-    let v: Value = match serde_json::from_str(json_str) {
-        Ok(v)  => v,
-        Err(e) => {
-            eprintln!("  {} Negotiate JSON parse failed: {} | body snippet: {}",
-                "[AUTH]".red(), e, &json_str.chars().take(120).collect::<String>());
-            return None;
-        }
-    };
-
-    match v["ConnectionToken"].as_str() {
-        Some(t) => {
-            println!("  {} Got fresh connectionToken (len={})", "[AUTH]".green(), t.len());
-            Some(t.to_string())
-        }
-        None => {
-            eprintln!("  {} ConnectionToken missing in negotiate response: {}", "[AUTH]".red(), json_str);
-            None
-        }
-    }
-}
-
-fn build_ws_url(host: &str, base_token: &str, connection_token: &str) -> String {
-    format!(
-        "wss://{}/JetXNode703/signalr/connect\
-         ?transport=webSockets\
-         &clientProtocol=1.5\
-         &token={}\
-         &group=JetX\
-         &connectionToken={}\
-         &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D\
-         &tid=4",
-        host,
-        base_token,
-        url_encode(connection_token)
-    )
-}
-
-// ── Single WebSocket session — NO reconnect loop ──────────────────────────────
-
-async fn run_ws_session(host: String, base_token: String) {
+async fn run_ws_session() {
     let mut state = AppState::new();
 
-    // ── Step 1: negotiate a fresh connectionToken ─────────────────────────────
-    // This is what fixes the 404: the long connectionToken in a hardcoded URL
-    // expires within minutes. We fetch a fresh one every time we start.
-    let ws_url = match negotiate_token(&base_token).await {
-        Some(conn_token) => {
-            let url = build_ws_url(&host, &base_token, &conn_token);
-            println!("  {} WS URL built with fresh token", "[AUTH]".green());
-            url
-        }
-        None => {
-            // Negotiate failed — nothing we can do without a valid token.
-            // Write shutdown record so you know why it stopped.
-            eprintln!(
-                "  {} Could not negotiate a token. \
-                 Check that WS_BASE_TOKEN env var is correct and not expired.",
-                "[ERROR]".red().bold()
-            );
-            WS_DEAD.store(true, Ordering::Relaxed);
-            write_shutdown_record("negotiate_failed_bad_base_token", state.round_number);
-            return;
-        }
-    };
+    println!("  {} Connecting to: {}", "[WS]".bright_yellow(),
+        WS_URL.split('?').next().unwrap_or(WS_URL).yellow());
 
-    println!("  {} Connecting…", "[WS]".bright_yellow());
-
-    // ── TLS: permissive, exactly like the working reference code ──────────────
-    // This is the #1 silent killer: strict TLS drops the connection instantly
-    // and the error looks identical to a network failure.
+    // Permissive TLS — same as the working reference code.
+    // Strict TLS silently drops the connection and looks like a network failure.
     let connector = match NativeTlsConnector::builder()
-        .danger_accept_invalid_certs(true)      // same as working reference
-        .danger_accept_invalid_hostnames(true)  // same as working reference
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
         .build()
     {
         Ok(c)  => c,
@@ -706,7 +582,7 @@ async fn run_ws_session(host: String, base_token: String) {
     // 15-second connect timeout prevents hanging forever on a bad URL
     let ws_stream = match timeout(
         Duration::from_secs(15),
-        connect_async_tls_with_config(&ws_url, None, false, Some(connector))
+        connect_async_tls_with_config(WS_URL, None, false, Some(connector))
     ).await {
         Err(_) => {
             eprintln!("  {} Connect timed out (15s)", "[ERROR]".red());
@@ -716,12 +592,13 @@ async fn run_ws_session(host: String, base_token: String) {
         }
         Ok(Err(e)) => {
             let msg = e.to_string();
-            let hint = if msg.contains("404") || msg.contains("403") || msg.contains("401") {
-                " ← token likely expired; get a fresh WS_BASE_TOKEN from browser DevTools"
+            if msg.contains("404") || msg.contains("403") || msg.contains("401") {
+                eprintln!("  {} WS connect error: {}", "[ERROR]".red(), msg);
+                eprintln!("  {} The connectionToken in WS_URL has expired.", "[404]".red().bold());
+                eprintln!("  {} Open Chrome DevTools → Network → WS tab → copy the full URL → paste into WS_URL in main.rs → redeploy.", "[FIX]".yellow());
             } else {
-                ""
-            };
-            eprintln!("  {} WS connect error: {}{}", "[ERROR]".red(), msg, hint);
+                eprintln!("  {} WS connect error: {}", "[ERROR]".red(), msg);
+            }
             WS_DEAD.store(true, Ordering::Relaxed);
             write_shutdown_record(&format!("ws_connect_error: {}", e), state.round_number);
             return;
@@ -843,64 +720,29 @@ async fn main() -> std::io::Result<()> {
     println!("{}", "║      JetX Scraper — Single-Session / Manual Redeploy     ║".bright_cyan().bold());
     println!("{}", "╚══════════════════════════════════════════════════════════╝".bright_cyan());
     println!();
-    println!("  Design:");
-    println!("    {} NO auto-reconnect — redeploy manually to check the gap", "•".yellow());
-    println!("    {} HTTP server keeps the cloud instance alive", "•".green());
-    println!("    {} Permissive TLS (danger_accept_invalid_certs=true)", "•".green());
-    println!("    {} 30s silence watchdog shuts WS cleanly", "•".green());
-    println!("    {} History saved to {} after every crash", "•".green(), HISTORY_FILE);
-    println!("    {} Shutdown record saved to {}", "•".green(), SHUTDOWN_FILE);
-    println!("    {} /health reports ws_dead=true when session ends", "•".green());
+    println!("  {} NO auto-reconnect  — redeploy manually to check the gap", "•".yellow());
+    println!("  {} HTTP health server — keeps cloud instance alive via cron pings", "•".green());
+    println!("  {} Permissive TLS     — danger_accept_invalid_certs=true", "•".green());
+    println!("  {} 30s silence watchdog", "•".green());
+    println!("  {} History saved to {} after every crash", "•".green(), HISTORY_FILE);
+    println!("  {} Shutdown record → {}", "•".green(), SHUTDOWN_FILE);
+    println!();
+    println!("  When you get a 404:");
+    println!("  1. Chrome DevTools → Network → WS tab → right-click connection → Copy URL");
+    println!("  2. Paste it as WS_URL in main.rs (line ~560)");
+    println!("  3. Redeploy");
     println!();
 
-    // ── WS config ─────────────────────────────────────────────────────────────
-    // Set these two env vars on your cloud platform — no recompile needed.
-    //
-    //   WS_HOST        the server host, e.g. eu-server-w15.ssgportal.com
-    //                  (the "w15" part sometimes changes — copy from browser DevTools)
-    //
-    //   WS_BASE_TOKEN  the short  token=  value from the WS URL in DevTools
-    //                  e.g.  7f854388-e80e-49d2-bf10-998d69879ce0
-    //                  This is a UUID — it expires but lasts longer than connectionToken.
-    //                  When you get a 404, this is the value you need to refresh.
-    //
-    // The long connectionToken is fetched automatically via /negotiate on startup.
-    // You never need to paste the full 300-character URL again.
-
-    let ws_host = env::var("WS_HOST")
-        .unwrap_or_else(|_| "eu-server-w15.ssgportal.com".to_string());
-
-    let ws_base_token = env::var("WS_BASE_TOKEN")
-        .unwrap_or_else(|_| {
-            // Fallback to the token from the working reference code.
-            // !! Update WS_BASE_TOKEN env var when this expires !!
-            "7f854388-e80e-49d2-bf10-998d69879ce0".to_string()
-        });
-
-    let port: u16 = env::var("PORT")
+    let port: u16 = std::env::var("PORT")
         .unwrap_or_else(|_| "8000".to_string())
         .parse()
         .unwrap_or(8000);
 
-    println!("  HTTP port          : {}", port);
-    println!("  WS host            : {}", ws_host.yellow());
-    println!("  Base token         : {}…", &ws_base_token.chars().take(8).collect::<String>().yellow());
-    println!("  connectionToken    : fetched fresh via /negotiate on startup");
-    println!();
-    println!("  Env vars to set on your cloud platform:");
-    println!("    WS_HOST          = eu-server-wXX.ssgportal.com   (from DevTools)");
-    println!("    WS_BASE_TOKEN    = <uuid token=>                  (from DevTools)");
-    println!("    PORT             = 8000                           (usually auto-set)");
-    println!();
-    println!("  Point a cron ping at GET /health every 5 minutes:");
-    println!("    https://cron-job.org  or  https://uptimerobot.com");
-    println!();
-    println!("  When the session ends: ws_dead=true at /health.");
-    println!("  Check {} for reason + timestamp.", SHUTDOWN_FILE);
-    println!("  Then update WS_BASE_TOKEN if you got a 404, and redeploy.");
+    println!("  HTTP port : {}", port);
+    println!("  WS node   : {}", WS_URL.split('/').nth(2).unwrap_or("?").yellow());
     println!();
 
-    tokio::spawn(run_ws_session(ws_host, ws_base_token));
+    tokio::spawn(run_ws_session());
 
     HttpServer::new(|| {
         App::new()
