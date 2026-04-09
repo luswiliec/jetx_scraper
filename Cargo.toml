@@ -13,8 +13,7 @@ tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 tungstenite        = { version = "0.21", features = ["native-tls"] }
 
 # ── TLS — same builder the working reference uses ────────────────────────────
-native-tls       = "0.2"
-tokio-native-tls = "0.3"   # needed for async negotiate HTTP over TLS
+native-tls = "0.2"
 
 # ── Async runtime ─────────────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }
