@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::Message, Connector};
 
@@ -36,6 +37,10 @@ use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::protocol::Me
 /// If no WS message arrives for this many seconds, treat the connection as dead
 /// and shut the WS task down cleanly (HTTP stays alive, /health reports false).
 const SILENCE_TIMEOUT_SECS: u64 = 30;
+
+/// Send a WebSocket Ping frame this often to keep the connection alive.
+/// This prevents the server from dropping a silent connection between game rounds.
+const WS_PING_INTERVAL_SECS: u64 = 20;
 
 const HISTORY_FILE:   &str = "jetx_history.json";
 const SHUTDOWN_FILE:  &str = "jetx_last_shutdown.txt";
@@ -49,6 +54,9 @@ static WS_CONNECTED:   AtomicBool = AtomicBool::new(false);
 /// /health exposes this so you know exactly when to redeploy.
 static WS_DEAD:        AtomicBool = AtomicBool::new(false);
 static MSG_COUNT:      AtomicU32 = AtomicU32::new(0);
+/// Counts outgoing WS ping frames — visible at /health so you can confirm
+/// the heartbeat is actually running.
+static PING_COUNT:     AtomicU32 = AtomicU32::new(0);
 
 // ── HTTP Health Endpoints ─────────────────────────────────────────────────────
 //
@@ -66,6 +74,7 @@ async fn root() -> impl Responder {
         "rounds_this_session": ROUND_COUNT.load(Ordering::Relaxed),
         "history_rounds": HISTORY_LEN.load(Ordering::Relaxed),
         "messages_received": MSG_COUNT.load(Ordering::Relaxed),
+        "ws_pings_sent": PING_COUNT.load(Ordering::Relaxed),
         "action": if WS_DEAD.load(Ordering::Relaxed) {
             "redeploy needed — check jetx_last_shutdown.txt for gap info"
         } else {
@@ -85,6 +94,7 @@ async fn health() -> impl Responder {
         "ws_dead":      dead,
         "rounds":       ROUND_COUNT.load(Ordering::Relaxed),
         "messages":     MSG_COUNT.load(Ordering::Relaxed),
+        "ws_pings_sent": PING_COUNT.load(Ordering::Relaxed),
     }))
 }
 
@@ -546,7 +556,15 @@ fn process_message(raw: &str, state: &mut AppState) {
 // That's it. No env vars. No negotiate. Just paste and redeploy.
 
 // !! PASTE YOUR FULL WEBSOCKET URL HERE — replace on every redeploy !!
-const WS_URL: &str = "wss://eu-server-w16.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=f19ac25e-92b8-47b9-a32e-e24190741325&group=JetX&connectionToken=bfXru2b7OWiy5OZTJou2YUrKyc0q4HtNOhrj4xVST%2FKVdiqLQJ%2BtLkOvLtHmxtLRuN3ZWOl56YnOQIBirdEwzSRLvB9BBix638eDGBByd7qxA7B0D%2B1Rb7VA2DRE5ybG&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=8";
+const WS_URL: &str = "wss://eu-server-w15.ssgportal.com/JetXNode703/signalr/connect\
+    ?transport=webSockets\
+    &clientProtocol=1.5\
+    &token=7f854388-e80e-49d2-bf10-998d69879ce0\
+    &group=JetX\
+    &connectionToken=3fwTFY%2FaFBDxgVzCELGL11e18VfMndoJ9uGPP46WWhkXgkxEtM0GrX2fDFruh1u\
+    %2BBfgPJtstxnVFMUUO2NSOe3JJpEDUXPvjaVYbvHI9gxdsrL6uu4%2B2P0PU7W8FOpBI\
+    &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D\
+    &tid=2";
 
 async fn run_ws_session() {
     let mut state = AppState::new();
@@ -555,7 +573,6 @@ async fn run_ws_session() {
         WS_URL.split('?').next().unwrap_or(WS_URL).yellow());
 
     // Permissive TLS — same as the working reference code.
-    // Strict TLS silently drops the connection and looks like a network failure.
     let connector = match NativeTlsConnector::builder()
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true)
@@ -571,7 +588,6 @@ async fn run_ws_session() {
     };
     let connector = Connector::NativeTls(connector);
 
-    // 15-second connect timeout prevents hanging forever on a bad URL
     let ws_stream = match timeout(
         Duration::from_secs(15),
         connect_async_tls_with_config(WS_URL, None, false, Some(connector))
@@ -603,7 +619,7 @@ async fn run_ws_session() {
 
     let (mut write, mut read) = ws_stream.split();
 
-    // SignalR handshake — send empty JSON, same as working reference
+    // SignalR handshake
     if let Err(e) = write.send(Message::Text("{}".into())).await {
         eprintln!("  {} Handshake send failed: {}", "[ERROR]".red(), e);
         WS_CONNECTED.store(false, Ordering::Relaxed);
@@ -612,15 +628,72 @@ async fn run_ws_session() {
         return;
     }
 
+    // ── Heartbeat: send a WS Ping frame every WS_PING_INTERVAL_SECS ────────────
+    //
+    // WHY THIS IS NEEDED:
+    //   Between game rounds the server goes quiet for 10–20 seconds.
+    //   Some load balancers / NAT routers drop idle TCP connections after ~30s
+    //   of silence.  Sending a Ping frame resets that idle timer on every hop
+    //   between us and the server, so the connection stays open indefinitely.
+    //
+    //   This is separate from the HTTP cron ping — that keeps the cloud instance
+    //   alive.  This ping keeps the WebSocket connection itself alive.
+    //
+    // HOW IT WORKS:
+    //   We give the writer half to a background task via an mpsc channel.
+    //   The ping task owns the writer and wakes every WS_PING_INTERVAL_SECS.
+    //   The reader loop sends Pong frames and regular messages through the same
+    //   channel so everything goes through one serialised writer.
+
+    // Channel: reader loop → writer task
+    // Messages: either a Pong reply OR a data frame (currently only Pong needed)
+    let (tx, mut rx) = mpsc::channel::<Message>(16);
+
+    // Clone tx for the ping timer
+    let ping_tx = tx.clone();
+
+    // ── Writer task: owns the write half, drains the channel ─────────────────
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if write.send(msg).await.is_err() {
+                break;
+            }
+        }
+        // Channel closed → reader loop exited → write half can be dropped
+    });
+
+    // ── Ping timer task: fires every WS_PING_INTERVAL_SECS ───────────────────
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(WS_PING_INTERVAL_SECS);
+        loop {
+            tokio::time::sleep(interval).await;
+            let count = PING_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            println!(
+                "  {} Sending WS keepalive ping #{} (every {}s)",
+                "[PING]".bright_black(), count, WS_PING_INTERVAL_SECS
+            );
+            // If the channel is closed (session ended) this will error and the
+            // task exits cleanly on next iteration.
+            if ping_tx.send(Message::Ping(vec![])).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let silence_dur = Duration::from_secs(SILENCE_TIMEOUT_SECS);
     let session_start = Instant::now();
 
-    println!("  {} Listening for messages…", "[WS]".bright_cyan());
+    println!(
+        "  {} Listening… (WS ping every {}s, silence watchdog {}s)",
+        "[WS]".bright_cyan(), WS_PING_INTERVAL_SECS, SILENCE_TIMEOUT_SECS
+    );
 
     loop {
         match timeout(silence_dur, read.next()).await {
 
             // ── 30-second silence → stale connection ──────────────────────────
+            // NOTE: a Pong reply from the server resets this timer, so as long
+            // as the server responds to our pings this watchdog won't fire.
             Err(_) => {
                 let reason = format!(
                     "silence_{}s_after_{}s_session_{}_rounds",
@@ -629,7 +702,7 @@ async fn run_ws_session() {
                     state.round_number
                 );
                 eprintln!(
-                    "\n  {} No data for {}s — connection is stale. Shutting WS down.",
+                    "\n  {} No data for {}s (not even a Pong) — connection is dead.",
                     "[WATCHDOG]".red().bold(), SILENCE_TIMEOUT_SECS
                 );
                 save_history(&state.history);
@@ -670,7 +743,7 @@ async fn run_ws_session() {
                 return;
             }
 
-            // ── Normal text message ───────────────────────────────────────────
+            // ── Normal game data ──────────────────────────────────────────────
             Ok(Some(Ok(Message::Text(text)))) => {
                 let t = text.trim();
                 if !t.is_empty() && t != "{}" {
@@ -678,9 +751,16 @@ async fn run_ws_session() {
                 }
             }
 
-            // ── Server ping → respond with pong (keeps connection alive) ─────
+            // ── Server sent us a Ping → reply with Pong via the writer task ───
             Ok(Some(Ok(Message::Ping(data)))) => {
-                let _ = write.send(Message::Pong(data)).await;
+                let _ = tx.send(Message::Pong(data)).await;
+            }
+
+            // ── Server Pong in response to our keepalive Ping ─────────────────
+            Ok(Some(Ok(Message::Pong(_)))) => {
+                // Receiving a Pong means the connection is alive.
+                // The timeout above is reset just by receiving this frame.
+                println!("  {} Pong received — connection confirmed alive", "[PONG]".bright_black());
             }
 
             // ── Server closed the connection ──────────────────────────────────
@@ -699,7 +779,7 @@ async fn run_ws_session() {
                 return;
             }
 
-            Ok(Some(Ok(_))) => {} // Binary, Pong, Frame — ignore
+            Ok(Some(Ok(_))) => {} // Binary, Frame — ignore
         }
     }
 }
@@ -714,10 +794,15 @@ async fn main() -> std::io::Result<()> {
     println!();
     println!("  {} NO auto-reconnect  — redeploy manually to check the gap", "•".yellow());
     println!("  {} HTTP health server — keeps cloud instance alive via cron pings", "•".green());
-    println!("  {} Permissive TLS     — danger_accept_invalid_certs=true", "•".green());
-    println!("  {} 30s silence watchdog", "•".green());
+    println!("  {} WS ping every {}s  — keeps WebSocket connection alive", "•".green(), WS_PING_INTERVAL_SECS);
+    println!("  {} {}s silence watchdog — fires only if server stops responding to pings", "•".green(), SILENCE_TIMEOUT_SECS);
+    println!("  {} Permissive TLS (danger_accept_invalid_certs=true)", "•".green());
     println!("  {} History saved to {} after every crash", "•".green(), HISTORY_FILE);
     println!("  {} Shutdown record → {}", "•".green(), SHUTDOWN_FILE);
+    println!();
+    println!("  Two separate keep-alive mechanisms:");
+    println!("    1. HTTP cron ping  → keeps the Koyeb instance from sleeping");
+    println!("    2. WS Ping frame   → keeps the WebSocket TCP connection open");
     println!();
     println!("  When you get a 404:");
     println!("  1. Chrome DevTools → Network → WS tab → right-click connection → Copy URL");
