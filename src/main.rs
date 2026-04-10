@@ -556,15 +556,8 @@ fn process_message(raw: &str, state: &mut AppState) {
 // That's it. No env vars. No negotiate. Just paste and redeploy.
 
 // !! PASTE YOUR FULL WEBSOCKET URL HERE — replace on every redeploy !!
-const WS_URL: &str = "wss://eu-server-w15.ssgportal.com/JetXNode703/signalr/connect\
-    ?transport=webSockets\
-    &clientProtocol=1.5\
-    &token=7f854388-e80e-49d2-bf10-998d69879ce0\
-    &group=JetX\
-    &connectionToken=3fwTFY%2FaFBDxgVzCELGL11e18VfMndoJ9uGPP46WWhkXgkxEtM0GrX2fDFruh1u\
-    %2BBfgPJtstxnVFMUUO2NSOe3JJpEDUXPvjaVYbvHI9gxdsrL6uu4%2B2P0PU7W8FOpBI\
-    &connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D\
-    &tid=2";
+const WS_URL: &str = "
+wss://eu-server-w16.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=9e5f4620-b2c5-46af-87aa-5a78e9ba2f7f&group=JetX&connectionToken=VQqiTFoOoN3%2FFoBWqHR9PNMwOqayvu3f7YK5iM6MHzRg7uLnUUuzgV6RyYIFUhDjOhfuwKkV70NzWyIUKOIykruEm67qQLsKOJ94WY3vkCeO4632ZWklT6ErCgA2I2Qh&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=0";
 
 async fn run_ws_session() {
     let mut state = AppState::new();
